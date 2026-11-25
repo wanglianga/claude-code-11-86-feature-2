@@ -328,3 +328,248 @@ CREATE TABLE IF NOT EXISTS load_count (
     capacity       INTEGER,
     load_factor    DOUBLE PRECISION
 );
+
+-- =====================================================================
+-- 客流迁移 / 旅程重建子系统（feature-2）
+-- 从 AFC 刷卡、AVL 车载定位、换乘记录重建实际旅程，量化短线折返的额外换乘损失。
+-- 与父任务“实验干扰处理”相互独立：这里是 OD 站对客流迁移与双引擎区间。
+-- =====================================================================
+
+-- 迁移子系统自己的车站维表（使用与父样例一致的 HUB-CENTRAL 命名）
+CREATE TABLE IF NOT EXISTS mig_station (
+    id            BIGSERIAL PRIMARY KEY,
+    experiment_id BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    code          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    is_hub        BOOLEAN NOT NULL DEFAULT FALSE,
+    attract       DOUBLE PRECISION NOT NULL DEFAULT 1.0, -- 下车吸引先验（由有刷下车样本校准）
+    UNIQUE (experiment_id, code)
+);
+
+-- 线路站序与运营参数（时刻表基线）
+CREATE TABLE IF NOT EXISTS mig_route (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    code           TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    stop_seq       TEXT NOT NULL,   -- 逗号分隔站码（有序）
+    headway_sec    INTEGER NOT NULL DEFAULT 300,
+    transfer_walk_sec INTEGER NOT NULL DEFAULT 180,
+    UNIQUE (experiment_id, code)
+);
+
+-- AFC 刷卡原始交易（绝大多数只有上车 TAP_IN，少量 TAP_OUT 用于校准/核验）
+CREATE TABLE IF NOT EXISTS mig_afc_tap (
+    id            BIGSERIAL PRIMARY KEY,
+    experiment_id BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    card_code     TEXT NOT NULL,
+    txn_type      TEXT NOT NULL, -- TAP_IN / TAP_OUT
+    service_date  DATE NOT NULL,
+    minute_of_day INTEGER NOT NULL, -- 当日分钟，确定性计算用
+    event_ts      TIMESTAMPTZ,
+    station_code  TEXT NOT NULL,
+    route_code    TEXT,
+    vehicle_code  TEXT,
+    trip_code     TEXT,          -- AFC 可能只给车不给班次；为空时由轨迹对齐补
+    passenger_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_afc_card ON mig_afc_tap(experiment_id, card_code);
+
+-- AVL 车载定位点（逐站到离时刻 + 定位质量；fix_ok=FALSE 区间即定位中断）
+CREATE TABLE IF NOT EXISTS mig_avl_point (
+    id            BIGSERIAL PRIMARY KEY,
+    experiment_id BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    trip_code     TEXT NOT NULL,
+    route_code    TEXT NOT NULL,
+    vehicle_code  TEXT NOT NULL,
+    service_date  DATE NOT NULL,
+    minute_of_day INTEGER NOT NULL,
+    event_ts      TIMESTAMPTZ,
+    station_code  TEXT,
+    seq_index     INTEGER NOT NULL,
+    progress_km   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    fix_ok        BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_avl_trip ON mig_avl_point(experiment_id, trip_code);
+
+-- 班次轨迹头：实际是否短线折返、折返站、定位中断区间
+CREATE TABLE IF NOT EXISTS mig_trip_trace (
+    id               BIGSERIAL PRIMARY KEY,
+    experiment_id    BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    trip_code        TEXT NOT NULL,
+    route_code       TEXT NOT NULL,
+    vehicle_code     TEXT NOT NULL,
+    service_date     DATE NOT NULL,
+    short_turn       BOOLEAN NOT NULL DEFAULT FALSE,
+    turn_stop        TEXT,
+    last_actual_stop TEXT,
+    outage           BOOLEAN NOT NULL DEFAULT FALSE,
+    outage_from_stop TEXT,
+    outage_to_stop   TEXT,
+    congestion_sec  INTEGER NOT NULL DEFAULT 0, -- AVL 相对时刻表的累计延误（拥堵错配来源）
+    UNIQUE (experiment_id, trip_code)
+);
+
+-- 换乘记录（同一卡短时间内第二次上车，或 fare 换乘标记）
+CREATE TABLE IF NOT EXISTS mig_transfer_record (
+    id            BIGSERIAL PRIMARY KEY,
+    experiment_id BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    card_code     TEXT NOT NULL,
+    service_date  DATE NOT NULL,
+    from_route    TEXT,
+    from_trip     TEXT,
+    from_station  TEXT,
+    to_route      TEXT NOT NULL,
+    to_trip       TEXT,
+    to_station    TEXT NOT NULL,
+    minute_of_day INTEGER NOT NULL,
+    wait_sec      INTEGER,
+    source        TEXT NOT NULL DEFAULT 'CARD_CHAIN' -- CARD_CHAIN / FARE_FLAG / SURVEY
+);
+CREATE INDEX IF NOT EXISTS idx_xfer_card ON mig_transfer_record(experiment_id, card_code);
+
+-- ① 上车观察账：每次首乘刷卡与 AVL/班次对齐后的观察
+CREATE TABLE IF NOT EXISTS mig_boarding_ledger (
+    id               BIGSERIAL PRIMARY KEY,
+    experiment_id    BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    boarding_code    TEXT NOT NULL UNIQUE,
+    card_code        TEXT NOT NULL,
+    service_date     DATE NOT NULL,
+    board_minute     INTEGER NOT NULL,
+    board_station    TEXT NOT NULL,
+    route_code       TEXT NOT NULL,
+    vehicle_code     TEXT,
+    matched_trip     TEXT,
+    align_status     TEXT NOT NULL, -- ALIGNED / NEAREST_FALLBACK / GPS_GAP_FUZZY / UNMATCHED
+    time_offset_sec  INTEGER NOT NULL DEFAULT 0,
+    location_outage  BOOLEAN NOT NULL DEFAULT FALSE,
+    short_turn       BOOLEAN NOT NULL DEFAULT FALSE,
+    turn_stop        TEXT,
+    has_tap_out      BOOLEAN NOT NULL DEFAULT FALSE,
+    observed_transfer BOOLEAN NOT NULL DEFAULT FALSE,
+    detail           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_board_exp ON mig_boarding_ledger(experiment_id);
+
+-- ③ 候选下车站集合（定位中断/无刷下车时保留多候选，不提前收敛）
+CREATE TABLE IF NOT EXISTS mig_alight_candidate (
+    id              BIGSERIAL PRIMARY KEY,
+    experiment_id   BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    boarding_code   TEXT NOT NULL,
+    station_code    TEXT NOT NULL,
+    rank_no         INTEGER NOT NULL,
+    prior_weight    DOUBLE PRECISION NOT NULL,
+    posterior_prob  DOUBLE PRECISION NOT NULL,
+    det_selected    BOOLEAN NOT NULL DEFAULT FALSE,
+    retain_reason   TEXT,
+    UNIQUE (experiment_id, boarding_code, station_code)
+);
+CREATE INDEX IF NOT EXISTS idx_cand_board ON mig_alight_candidate(boarding_code);
+
+-- 重建出的乘客旅程（同时保存确定性与概率两套结论）
+CREATE TABLE IF NOT EXISTS mig_rebuilt_journey (
+    id                  BIGSERIAL PRIMARY KEY,
+    experiment_id       BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    journey_code        TEXT NOT NULL UNIQUE,
+    boarding_code       TEXT NOT NULL,
+    card_code           TEXT NOT NULL,
+    origin_stop         TEXT NOT NULL,
+    -- 确定性时刻表分配
+    det_dest            TEXT,
+    det_path            TEXT,
+    det_transfers       INTEGER NOT NULL DEFAULT 0,
+    det_transfer_wait   INTEGER NOT NULL DEFAULT 0,
+    det_loss_sec        INTEGER NOT NULL DEFAULT 0,
+    det_confidence      DOUBLE PRECISION NOT NULL DEFAULT 1,
+    det_mismatch_risk   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- 概率旅程推断
+    prob_dest_map       TEXT,    -- JSON {dest: prob}
+    prob_option_map     TEXT,    -- JSON 全候选路径后验
+    prob_transfers_exp  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    prob_loss_mean      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    prob_loss_var       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    mig_prob            DOUBLE PRECISION NOT NULL DEFAULT 0, -- 折返导致额外换乘的后验概率
+    multi_candidate     BOOLEAN NOT NULL DEFAULT FALSE,
+    location_outage     BOOLEAN NOT NULL DEFAULT FALSE,
+    short_turn          BOOLEAN NOT NULL DEFAULT FALSE,
+    extra_transfer      BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_rj_exp ON mig_rebuilt_journey(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_rj_od ON mig_rebuilt_journey(experiment_id, origin_stop, det_dest);
+
+-- ④ 旅程流量矩阵：同一 OD 站对 × 两引擎的旅程量/迁移量/换乘损失区间
+CREATE TABLE IF NOT EXISTS mig_od_flow (
+    id              BIGSERIAL PRIMARY KEY,
+    experiment_id   BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    origin_stop     TEXT NOT NULL,
+    dest_stop       TEXT NOT NULL,
+    method          TEXT NOT NULL, -- DETERMINISTIC / PROBABILISTIC
+    origin_boardings INTEGER NOT NULL DEFAULT 0,
+    journey_point   DOUBLE PRECISION NOT NULL,
+    journey_low     DOUBLE PRECISION NOT NULL,
+    journey_high    DOUBLE PRECISION NOT NULL,
+    mig_point       DOUBLE PRECISION NOT NULL,
+    mig_low         DOUBLE PRECISION NOT NULL,
+    mig_high        DOUBLE PRECISION NOT NULL,
+    loss_mean_sec   DOUBLE PRECISION NOT NULL,
+    loss_low_sec    DOUBLE PRECISION NOT NULL,
+    loss_high_sec   DOUBLE PRECISION NOT NULL,
+    total_loss_hours DOUBLE PRECISION NOT NULL,
+    total_loss_low   DOUBLE PRECISION NOT NULL,
+    total_loss_high  DOUBLE PRECISION NOT NULL,
+    UNIQUE (experiment_id, origin_stop, dest_stop, method)
+);
+CREATE INDEX IF NOT EXISTS idx_od_exp ON mig_od_flow(experiment_id);
+
+-- ⑤ 抽样核验：人工/问卷抽样的 OD 与“是否因折返额外换乘”
+CREATE TABLE IF NOT EXISTS mig_survey_sample (
+    id            BIGSERIAL PRIMARY KEY,
+    experiment_id BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    sample_code   TEXT NOT NULL UNIQUE,
+    origin_stop   TEXT NOT NULL,
+    dest_stop     TEXT NOT NULL,
+    sample_n      INTEGER NOT NULL DEFAULT 1,  -- 聚合记录时的样本数
+    extra_yes     INTEGER NOT NULL DEFAULT 0,
+    od_population INTEGER NOT NULL DEFAULT 0,   -- 该 OD 可代表的上车总体（硬计数）
+    surveyed_at   DATE,
+    source        TEXT NOT NULL DEFAULT 'FIELD_SURVEY',
+    note          TEXT
+);
+
+-- OD 级核验结论（抽样区间 vs 推断区间）
+CREATE TABLE IF NOT EXISTS mig_verification (
+    id              BIGSERIAL PRIMARY KEY,
+    experiment_id   BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    origin_stop     TEXT NOT NULL,
+    dest_stop       TEXT NOT NULL,
+    sample_n        INTEGER NOT NULL,
+    extra_yes       INTEGER NOT NULL,
+    survey_share    DOUBLE PRECISION,
+    survey_low      DOUBLE PRECISION,
+    survey_high     DOUBLE PRECISION,
+    survey_vol_low  DOUBLE PRECISION,
+    survey_vol_high DOUBLE PRECISION,
+    infer_low       DOUBLE PRECISION,
+    infer_high      DOUBLE PRECISION,
+    intervals_overlap BOOLEAN NOT NULL DEFAULT TRUE,
+    status          TEXT NOT NULL, -- CORROBORATED / CONFLICT / NO_SURVEY / INSUFFICIENT
+    note            TEXT,
+    UNIQUE (experiment_id, origin_stop, dest_stop)
+);
+
+-- 发布门控：冲突 OD 禁止发布单点迁移量，只能发区间/暂缓
+CREATE TABLE IF NOT EXISTS mig_publication (
+    id            BIGSERIAL PRIMARY KEY,
+    experiment_id BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    scope         TEXT NOT NULL, -- REPORT 或 OD:E2>W2
+    publish_mode  TEXT NOT NULL, -- POINT / INTERVAL
+    status        TEXT NOT NULL, -- PUBLISHED / INTERVAL_ONLY / BLOCKED
+    point_value   DOUBLE PRECISION,
+    interval_low  DOUBLE PRECISION,
+    interval_high DOUBLE PRECISION,
+    payload       TEXT,
+    reason        TEXT,
+    published_by  TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pub_exp ON mig_publication(experiment_id);

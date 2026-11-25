@@ -15,7 +15,81 @@
 6. **估计器**：乘客人数加权 Hajek **ITT**、按随机化单元聚类的 CR1 区间、CACE/Wald-IV、跨线暴露率 Wilson 区间、簇方案 2⁴ 随机化推断（RI）。
 7. **独立护栏**：投诉率、满载班次占比、滞留/未完成旅程占比；任一硬护栏超限即 `STOP_EXPANSION`，扩围结论 `BLOCKED`，服务端同时拒绝人工改判 `GO`。
 8. **外部事件按事件时间关联**：暴雨停运、降雨、施工、临时改线均带事件窗口；投诉同时保存 `complaint_time` 与 `service_event_time`，统计只用后者。
-9. **界面**：随机分配、暴露路径、共同支持、客流结果、护栏、离线审阅、扩围证据等 10 个标签页；另含 Swagger UI / OpenAPI 3。
+9. **界面**：随机分配、暴露路径、共同支持、客流结果、护栏、离线审阅、扩围证据等标签页，另含 Swagger UI / OpenAPI 3。
+10. **客流迁移 / 旅程重建（feature-2，独立子系统）**：从 **AFC 刷卡 + AVL 车载定位 + 换乘记录**重建乘客实际旅程，建立**上车观察账 → 车辆轨迹对齐 → 候选下车站集合 → 旅程 OD 流量矩阵 → 抽样核验**闭环，量化**短线折返的额外换乘损失**。提供**确定性时刻表分配**与**概率贝叶斯旅程推断**双引擎，对**同一 OD 站对**各出旅程量与换乘损失区间；**定位中断保留多候选**，**抽样与推断冲突时服务端禁止发布单点迁移量（一律 409）**。前端新增“🚇 客流迁移重建”标签页（共 11 个主标签）。
+
+---
+
+## ★ 客流迁移 / 旅程重建子系统（feature-2）
+
+> 题目要点：客流迁移**不是**父任务的“实验干扰处理”，而是从**刷卡、车载定位、换乘记录**重建乘客实际旅程，
+> 量化**短线折返是否制造额外换乘损失**。必须建立：上车观察账、车辆轨迹对齐、候选下车站集合、旅程流量矩阵、抽样核验。
+> 确定性时刻表分配与概率旅程推断**两条路线都估计同一 OD 站对的旅程与换乘损失区间**；
+> **定位中断保留多候选**；**抽样调查与推断冲突时不得发布单点迁移量**。
+
+### A. 数据流水线与五件产物
+
+原始数据（确定性虚构，日期 `2026-06-02` 早高峰）落 `mig_afc_tap / mig_avl_point / mig_trip_trace /
+mig_transfer_record / mig_survey_sample`，重建后产出：
+
+| 步骤 | 产物表 / API | 说明 |
+| --- | --- | --- |
+| ① 上车观察账 | `mig_boarding_ledger` · `GET /api/migration/boardings` | 每张首乘 AFC 刷卡按 线路+车辆+站点时刻 对齐到 AVL 班次，状态 `ALIGNED / NEAREST_FALLBACK / GPS_GAP_FUZZY / UNMATCHED` |
+| ② 车辆轨迹对齐 | `mig_trip_trace`、`mig_avl_point` · `GET /api/migration/trajectories[/{trip}]` | 逐站到离时刻与 `fix_ok`；记录短线折返、折返站、定位中断区间、拥堵延误 |
+| ③ 候选下车站集合 | `mig_alight_candidate` · `GET /api/migration/candidates?boardingCode=` | 每个上车账保留排序候选及先验/后验；中断或后验分散时**不收敛为单一站** |
+| ④ 旅程流量矩阵 | `mig_rebuilt_journey`、`mig_od_flow` · `GET /api/migration/od-matrix` | 每 OD × `DETERMINISTIC/PROBABILISTIC` 两行：旅程量、迁移量、人均/总换乘损失，均带 `[low,high]` |
+| ⑤ 抽样核验 | `mig_verification` · `GET /api/migration/verification`、`/surveys` | Wilson 抽样区间 × 推断区间，结论 `CORROBORATED / CONFLICT / INSUFFICIENT` |
+| 发布门控 | `mig_publication` · `GET/POST /api/migration/publication|publish` | 冲突 OD/报告级**单点 409**；只允许 `INTERVAL` 包络区间 |
+
+一键总览：`GET /api/migration/workbench`（总览+矩阵+核验+门控+校准）。所有接口同时提供等价嵌套路径
+`/api/experiments/{id}/migration/...`，`id` 缺省自动取 `PILOT-R123-202606`；并提供 `/flows`、`/flow-matrix`、
+`/samples`、`/sampling`、`/candidate-stops`、`/boarding-ledger` 等常见别名。
+
+### B. 双引擎口径（纯逻辑内核 `engine/mig/MigrationEngine.java`，无 Spring/DB 依赖）
+
+- **确定性时刻表路径分配**：对齐 AVL 后按固定“吸引权重 + 广义费用”规则选**唯一**最可能下车站/路径，
+  换乘等待取时刻表名义值（步行 + 半班）。快、可解释；但在**短线折返无换乘刷卡、拥堵、定位中断**时会错配或过度自信。
+  其区间用“刷下车留出验证准确率”校准的分配错误带 `η=clip(1−acc, 8%,40%)` + 时刻表等待敏感包络构造。
+- **概率旅程推断（贝叶斯后验）**：枚举候选下车站与候选路线（直达 / 枢纽换乘 / 等下一班 / 漏刷换乘），
+  后验权重 ∝ 下车吸引先验（由 `TAP_OUT` 样本校准）× Logit 广义费用 × 刷下车/换乘链似然，
+  换乘等待作为带方差的随机量进入后验；定位中断时再与均匀候选做 30% “传感器无知”混合。
+  OD 区间用伯努利/分类矩 `Σq(1−q)` 与损失一/二阶矩解析得到（95%），歧义越大区间越宽。
+- **额外换乘损失（秒）** = 实际换乘等待 + 换乘次数 × `300s` 感知惩罚；相对“该 OD 无折返直达基线”，
+  仅把**可归因于短线折返的新增换乘**计入迁移损失。
+
+### C. 两条硬纪律（服务端强制，有测试与 e2e 断言）
+
+1. **定位中断保留多候选**：`R2-GAP-0812` 在 `HUB-CENTRAL→W-STATION` 间中断、`W-CULTURE` 无 fix。
+   样例卡 `C-DEMO-GAP-01` 对齐为 `ALIGNED` 但 `location_outage=true`，保留
+   `W-STATION≈0.55 / W-CULTURE≈0.25 / N-NORTH≈0.20` 三个 ≥0.1 的候选；
+   上车站正落在中断区间的 `C-DEMO-FUZZY-01` 走插值模糊对齐，状态 `GPS_GAP_FUZZY`。
+2. **抽样冲突禁发单点**：OD `E2-EXPO → W-STATION` 推断迁移量约 **45.6 [38.4, 52.8]**，
+   而刻意构造的抽样 `52` 人中仅 `1` 人报告额外换乘（代表总体 54），Wilson 体积区间约 **[0.2, 5.5]**，
+   两区间不重叠 → `CONFLICT`。此后：
+   - `POST /api/migration/publish {"scope":"REPORT","mode":"POINT"}` → **409**；
+   - 对该 OD `mode:"POINT"` → **409**，**任何角色（含 approver）都不能绕过**；
+   - `mode:"INTERVAL"` 始终允许，落库为 `INTERVAL_ONLY` 的跨“两引擎+抽样”包络区间。
+   - 对照：`E-LAKE → W-STATION` 抽样与推断重叠（`CORROBORATED`），其单点可正常发布；
+     `HUB-CENTRAL → W-STATION` 样本 `n=6<10` 判 `INSUFFICIENT`，不据此判冲突也不支持单点。
+
+### D. 可复现样例规模与数字（固定确定性构造，重算结果稳定）
+
+启动后播种 **235** 个上车观察账/重建旅程、**23** 个 OD（`mig_od_flow` 46 行）、**18** 个定位中断个案。
+关键 OD（概率引擎，2026-06-02 早高峰）：
+
+| OD | 迁移量（人）95% 区间 | 人均额外换乘损失（秒）区间 | 总损失（小时） |
+| --- | --- | --- | --- |
+| `E2-EXPO → W-STATION`（冲突 OD） | **45.6 [38.4, 52.8]** | **606 [507, 705]** | 7.68 |
+| `E-LAKE → W-STATION`（抽样相容） | **28.5 [22.8, 34.2]** | **595 [472, 719]** | 4.72 |
+
+确定性规则在 **76** 张“有刷下车”卡上的隐藏目的地留出准确率约 **0.553**（系统性偏向最大吸引站 `W-STATION`，
+恰好示范其在多目的站/无下车场景的错配），校准错误带取上限 `η=0.40`；概率引擎则如实把这种不确定展开为宽区间。
+命名核验卡：`C-DEMO-SHORT-01`（折返+观察到换乘）、`C-DEMO-GAP-01`（中断三候选）、
+`C-DEMO-FUZZY-01`（模糊对齐）、`C-DEMO-MISS-01`（无换乘刷卡：确定性错配到折返站、概率保留换乘后验）、
+`C-DEMO-TAPOUT-01`（刷下车锚点）、`C-DEMO-CONG-01`（拥堵长等待）。
+
+前端“🚇 客流迁移重建”页含 6 个子视图：OD 双引擎区间矩阵、上车观察账（筛选/搜索/弹窗候选与路径后验）、
+轨迹对齐（逐站 fix 时间线）、候选下车/重建旅程、抽样核验、发布门控（冲突单点按钮会收到 409 行内提示，附发布历史）。
 
 ---
 
@@ -115,13 +189,41 @@ mvn test
 结果（最后一次实际运行）：
 
 ```
-Tests run: 16, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 22, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
 覆盖：50% 平衡分配与确定性哈希、R1/R2 聚类/R3 独立、全部命名路径分类
 （分流/同车普通对照/对照转乘处理/全程 T/全程 C/不执行/两类 UNKNOWN）、
-聚类 ITT 公式、Wilson 区间与 RI 枚举。
+聚类 ITT 公式、Wilson 区间与 RI 枚举；feature-2 另加 **6 个**迁移引擎测试
+（中断多候选与 `GPS_GAP_FUZZY`、折返损失区间下界为正、冲突门控、相容/证据不足三态、确定性留出准确率）。
+
+### 1b. 客流迁移不变量脚本（feature-2，实际执行 ✅）
+
+```bash
+./verify-migration.sh          # 默认 http://127.0.0.1:8080，可传 BASE_URL
+```
+
+同样仅依赖 `bash/curl/python3` 标准库，实际结果：
+
+```
+通过 49 项，失败 0 项
+ALL_MIGRATION_CHECKS_PASSED
+```
+
+核验：五类产物数量、中断样例 ≥2 候选且后验和约为 1、`GPS_GAP_FUZZY` 模糊对齐、
+折返/中断轨迹头、双引擎同一 OD 且区间包含点估计/损失下界为正、抽样三态、
+冲突 OD 与报告级单点均 409、相容 OD 单点 200、区间发布 `INTERVAL_ONLY`、
+viewer 403 / 未认证 401、重算幂等、7 个路径别名与前端标签资源。
+
+### 1c. 全新空库初始化（实际执行 ✅）
+
+除在开发库反复重算外，我还新建了一个空 PostgreSQL 库并以
+`DB_URL=jdbc:postgresql://127.0.0.1:5432/<fresh_db> SERVER_PORT=8081 java -jar target/transit-pilot.jar`
+启动，验证 `schema.sql` 在空库一次性建表、父样例与迁移样例自动播种成功；
+对该实例分别运行 `./verify-migration.sh http://127.0.0.1:8081`（49/0）与
+`./verify.sh http://127.0.0.1:8081`（34/0）均通过。这等价覆盖了 Docker Compose 中
+“全新 PG volume 首次启动 + 自动建表播种”的应用侧路径。
 
 ### 2. 端到端不变量脚本（实际执行 ✅）
 
@@ -151,9 +253,19 @@ ALL_VERIFY_CHECKS_PASSED
 
 ### 3. 前端渲染冒烟（实际执行 ✅）
 
-本环境没有浏览器，我用临时目录中的 `jsdom` 对**真实运行的后端**加载 `index.html + app.js`：
-10 个标签页全部成功渲染、命名旅程弹窗输出逐段判定追踪、`CROSS_MIXED` 过滤可交互，
-结果 `UI_SMOKE_OK`，无运行时错误。该冒烟脚本在 `/tmp/uismoke/smoke.mjs`（临时目录，不属于交付物）。
+本环境没有浏览器，我在临时目录用 `jsdom@24` 对**真实运行的后端**加载磁盘上最新的
+`index.html + app.js`（脚本 `/tmp/miguismoke/smoke.mjs`，临时目录，不属于交付物）：
+依次切换全部 **11** 个主标签确认无“加载失败”/无未捕获 JS 错误，再对“客流迁移重建”页做深度交互——
+OD 矩阵默认过滤与“显示全部”、`上车账/轨迹/旅程/核验/发布` 五个子视图、
+中断个案候选弹窗（≥2 条概率条）、轨迹逐站弹窗、报告级单点收到 409 行内提示、相容 OD 单点成功，
+实际结果：
+
+```
+UI_SMOKE 27/27 passed
+UI_SMOKE_OK
+```
+
+> 说明：jsdom 不做真实布局，只验证 DOM 渲染与交互逻辑无运行时错误；未做像素级视觉校验。
 
 ### 4. 我没有执行的验证
 
@@ -224,6 +336,8 @@ ALL_VERIFY_CHECKS_PASSED
 | `GET/POST /api/experiments/{id}/guardrails[/evaluate]` | 护栏规则/最新评估/重新评估 |
 | `GET /api/experiments/{id}/expansion`、`POST .../expansion/evaluate|decide` | 扩围证据与结论（APPROVER） |
 | `GET /api/experiments/{id}/review-bundle` | 离线审阅包（冻结配置+分配哈希+追踪+结果） |
+| `GET /api/migration/workbench`、`/od-matrix`、`/boardings`、`/trajectories`、`/candidates`、`/journeys`、`/surveys`、`/verification`、`/publication` | **feature-2 客流迁移重建**：五产物 + 双引擎 OD 区间 + 抽样核验（详见上文 ★ 章节；均有 `/api/experiments/{id}/migration/*` 等价路径） |
+| `POST /api/migration/rebuild`、`POST /api/migration/publish` | 从原始 AFC/AVL/换乘重算；冲突 OD 单点发布服务端 409（ANALYST+） |
 | `GET /api/experiments/{id}/events`、`/complaints` | 外部事件时间线、投诉时间关联核验 |
 
 ---
@@ -233,15 +347,17 @@ ALL_VERIFY_CHECKS_PASSED
 ```
 src/main/java/com/ccdev/transit/
   engine/            # 纯逻辑、无 Spring：确定性哈希、平衡分配、网络聚类、路径分类、统计/RI
-  service/           # 登记冻结、确定性播种器、分析流水线、扩围决策
-  web/               # REST 控制器与 DTO
+  engine/mig/        # feature-2：MigrationEngine 双引擎、Mig 类型、MigSampleData 确定性样例
+  service/           # 登记冻结、确定性播种器、分析流水线、扩围决策、Migration(Seed)Service
+  web/               # REST 控制器与 DTO（含 MigrationController）
   config/ security/  # Spring Security 三角色、OpenAPI、jsonb 响应处理
 src/main/resources/
-  schema.sql         # 幂等 PostgreSQL 建表
-  static/            # 原生 JS 单页控制台（login/index/app/styles）
-src/test/java/...    # 16 个纯 JUnit 测试（不依赖数据库/Docker）
-verify.sh            # 34 项端到端不变量
-Dockerfile docker-compose.yml docker-settings.xml
+  schema.sql         # 幂等 PostgreSQL 建表（父实验表 + mig_* 迁移子系统表）
+  static/            # 原生 JS 单页控制台（login/index/app/styles，含“客流迁移重建”页）
+src/test/java/...    # 22 个纯 JUnit 测试（不依赖数据库/Docker，其中 6 个迁移引擎测试）
+verify.sh            # 父任务 34 项端到端不变量
+verify-migration.sh  # feature-2 49 项端到端不变量
+Dockerfile docker-compose.yml docker-settings.xml .gitattributes
 ```
 
 关键口径：

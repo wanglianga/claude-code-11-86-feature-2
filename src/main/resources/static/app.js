@@ -93,6 +93,7 @@ const TAB_TITLES = {
   exposure: ['暴露路径台账', '逐段关联计划分配、GPS 实际运行、折返/加班偏离与完整路径'],
   support: ['共同支持', '按时段 × 起讫区间 × 天气 × 可达性检查两臂可比范围'],
   analysis: ['客流结果估计', '乘客旅程加权 ITT、跨线暴露、CACE 与随机化推断区间'],
+  migration: ['客流迁移 · 旅程重建', '刷卡 + 车载定位 + 换乘记录重建实际旅程；确定性/概率双引擎估计同一 OD 的迁移与换乘损失区间'],
   guardrails: ['投诉与满载护栏', '独立于平均候车改善；任一硬护栏超限即停止扩围'],
   review: ['离线审阅', '冻结证据包、确定性复算与完整 JSON 导出'],
   expansion: ['扩围证据', '主要指标 + 护栏证据形成 GO / HOLD / BLOCKED 结论']
@@ -755,6 +756,405 @@ RENDER.expansion = async function () {
       if (e.status === 409) toast('服务端拒绝：' + e.message, true);
     }
   });
+};
+
+/* =====================================================================
+   客流迁移 · 旅程重建（feature-2）
+   刷卡 + AVL 定位 + 换乘记录 -> 上车账/轨迹对齐/候选下车站/OD 双引擎区间/抽样核验/发布门控
+   ===================================================================== */
+const MIG = { sub: 'matrix', wb: null, onlyMig: true, align: 'ALL', outageOnly: false, jMulti: false };
+
+const MIG_VERIFY_META = {
+  CONFLICT: ['抽样冲突 · 禁止单点', 'red'],
+  CORROBORATED: ['抽样相容', 'green'],
+  INSUFFICIENT: ['证据不足(n<10)', 'amber'],
+  NO_SURVEY: ['无抽样', 'gray']
+};
+const MIG_ALIGN_META = {
+  ALIGNED: ['精确对齐', 'green'],
+  NEAREST_FALLBACK: ['最近班次兜底', 'blue'],
+  GPS_GAP_FUZZY: ['定位中断·模糊对齐', 'purple'],
+  UNMATCHED: ['未匹配', 'red']
+};
+function migHM(m) {
+  if (m === null || m === undefined) return '—';
+  const h = Math.floor(Number(m) / 60), mm = Number(m) % 60;
+  return String(h).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+}
+function migIv(point, lo, hi, d = 1) {
+  return `<span class="mono"><b>${fmt(point, d)}</b> <span class="muted small">[${fmt(lo, d)} , ${fmt(hi, d)}]</span></span>`;
+}
+function migBar(point, max, color) {
+  const w = Math.max(2, Math.min(100, (Number(point) / Math.max(Number(max), 1e-9)) * 100));
+  const bg = color === 'purple' ? 'var(--purple)' : color === 'red' ? 'var(--red,#d64545)' : '#9fb2cc';
+  return `<div class="bar" style="min-width:80px;height:8px"><div style="height:100%;width:${w}%;background:${bg};border-radius:999px"></div></div>`;
+}
+function migModal(html) {
+  $('#modal').innerHTML = `<button class="btn sm close" onclick="closeModal()">关闭</button>` + html;
+  $('#modal-back').classList.add('open');
+}
+
+RENDER.migration = async function () {
+  const wb = await api('/migration/workbench');
+  MIG.wb = wb;
+  const ov = wb.overview || {};
+  const g = wb.gate || {};
+  const dg = wb.diagnostics || {};
+  const conflicts = g.conflictOds || [];
+  const gateBanner = conflicts.length
+    ? `<div class="banner red"><span class="big">⛔</span><div>
+         <b>抽样调查与旅程推断在 ${conflicts.join('、')} 上冲突：不得发布单点迁移量。</b>
+         <div class="small">系统只允许发布双引擎+抽样的包络区间（INTERVAL_ONLY）；任何报告级/该 OD 的单点发布都会被服务端以 409 拒绝，且无角色可绕过。定位中断的个案始终保留多个候选下车站。</div>
+       </div></div>`
+    : `<div class="banner green"><span class="big">✅</span><div><b>抽样与推断相容，可发布单点迁移量。</b></div></div>`;
+
+  $('#tab-migration').innerHTML = `
+    <div class="banner blue" style="margin-top:0"><span class="big">🚇</span><div>
+      <b>这是客流迁移/旅程重建，不是父任务的实验干扰处理。</b>
+      从 AFC 刷卡、AVL 车载定位与换乘记录重建乘客实际旅程，量化<b>短线折返</b>是否制造额外换乘损失。
+      两条路线估计<b>同一 OD 站对</b>：<b>确定性时刻表分配</b>（快、可解释，拥堵/无刷下车会错配）与
+      <b>概率旅程推断</b>（候选路线+换乘等待后验，给不确定性，但先验需校准：留出准确率 ${pct(dg.detValidationAccuracy, 1)}，n=${dg.detValidationN}）。
+    </div></div>
+    ${gateBanner}
+    <div class="grid cards-4" style="margin-top:12px">
+      ${stat('上车观察账', ov.boardingLedger, '首乘刷卡 × AVL 对齐')}
+      ${stat('重建旅程', ov.rebuiltJourneys, '双引擎同时给结论')}
+      ${stat('OD 流量行', ov.odFlowRows, '23 站对 × 两引擎')}
+      ${stat('多候选旅程', ov.multiCandidateJourneys, '后验分散/定位中断保留', 'accent')}
+      ${stat('定位中断个案', ov.locationOutageCases, '保留 ≥2 下车站候选', 'purple')}
+      ${stat('短线折返个案', ov.shortTurnCases, 'R1 在中心枢纽折返')}
+      ${stat('额外换乘旅程', ov.extraTransferJourneys, '折返导致的新增换乘')}
+      ${stat('抽样冲突 OD', (ov.conflictOds || []).length, '冲突即禁发单点', (ov.conflictOds || []).length ? 'red' : '')}
+    </div>
+    <div class="toolbar" style="margin:14px 0 10px">
+      <div class="pill-row" id="mig-subnav">
+        ${[
+      ['matrix', '④ OD 流量矩阵/区间'],
+      ['boardings', '① 上车观察账'],
+      ['trajectories', '② 车辆轨迹对齐'],
+      ['journeys', '③ 候选下车/重建旅程'],
+      ['verification', '⑤ 抽样核验'],
+      ['publication', '📣 发布门控']
+    ].map(([k, label]) => `<button class="filter-chip ${MIG.sub === k ? 'active' : ''}" data-sub="${k}" onclick="migSub('${k}')">${label}</button>`).join('')}
+      </div>
+      <span style="flex:1"></span>
+      <button class="btn primary sm" id="mig-rebuild">▶ 从原始数据重算重建</button>
+    </div>
+    <div id="mig-body"></div>`;
+
+  $('#mig-rebuild').addEventListener('click', async () => {
+    try {
+      const r = await guardAction(() => api('/migration/rebuild', { method: 'POST' }), '已从原始 AFC/AVL/换乘数据重算');
+      MIG.wb = await api('/migration/workbench');
+      await migRenderSub();
+      if (r && r.reportGate) toast(`重建完成：${r.boardingCases} 个案 / ${r.odPairs} OD / 冲突 ${r.reportGate.conflictOds.length}`);
+    } catch { /* toast handled */ }
+  });
+
+  await migRenderSub();
+};
+
+window.migSub = async function (s) {
+  MIG.sub = s;
+  $$('#mig-subnav .filter-chip').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
+  await migRenderSub();
+};
+
+async function migRenderSub() {
+  const el = $('#mig-body');
+  if (!el) return;
+  el.innerHTML = '<div class="muted" style="padding:24px;text-align:center">加载中…</div>';
+  try { await MIG_VIEW[MIG.sub](el); }
+  catch (e) { el.innerHTML = `<div class="banner red">加载失败：${e.message}</div>`; }
+}
+
+const MIG_VIEW = {};
+
+/* ---------- ④ OD 矩阵 ---------- */
+MIG_VIEW.matrix = async function (el) {
+  const rows = (MIG.wb && MIG.wb.matrix) || [];
+  const vmap = {};
+  (MIG.wb.verification || []).forEach(v => { vmap[v.origin_stop + '|' + v.dest_stop] = v; });
+  const maxHigh = Math.max(1, ...rows.map(r => Math.max(r.probabilistic ? r.probabilistic.mig_high : 0)));
+  const shown = rows.filter(r => !MIG.onlyMig || (r.probabilistic && r.probabilistic.mig_point >= 0.5));
+  el.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-top:0">
+        <h3 style="margin:0">旅程流量矩阵 · 同一 OD 的双引擎估计与换乘损失区间</h3>
+        <span style="flex:1"></span>
+        <button class="filter-chip ${MIG.onlyMig ? 'active' : ''}" onclick="migToggleOnlyMig()">${MIG.onlyMig ? '只看有迁移量 ✓' : '只看有迁移量'}</button>
+      </div>
+      <p class="section-desc">括号内为 95% 区间。概率引擎区间来自候选路径后验的一/二阶矩；确定性区间由刷下车留出准确率校准的分配错误带 + 时刻表等待敏感包络。红色 OD 为抽样冲突。</p>
+      <div class="table-wrap"><table class="data">
+        <thead><tr>
+          <th>OD 站对</th><th class="num">上客</th>
+          <th>确定·旅程</th><th>确定·迁移量</th><th class="num">确定·人均损失(s)</th>
+          <th>概率·旅程</th><th>概率·迁移量</th><th style="min-width:120px">迁移量条</th><th class="num">概率·人均损失(s)</th><th>核验</th>
+        </tr></thead>
+        <tbody>${shown.map(r => {
+          const d = r.deterministic || {}, p = r.probabilistic || {};
+          const v = vmap[r.origin + '|' + r.dest];
+          const vm = v ? MIG_VERIFY_META[v.status] : null;
+          const conflict = v && v.status === 'CONFLICT';
+          return `<tr style="${conflict ? 'background:#fdeeec' : ''}">
+            <td><b>${r.origin}</b> → <b>${r.dest}</b>${conflict ? ' <span class="badge red">冲突</span>' : ''}</td>
+            <td class="num mono">${r.originBoardings}</td>
+            <td>${migIv(d.journey_point, d.journey_low, d.journey_high)}</td>
+            <td>${migIv(d.mig_point, d.mig_low, d.mig_high)}</td>
+            <td class="num">${d.mig_point > 0.05 ? migIv(d.loss_mean_sec, d.loss_low_sec, d.loss_high_sec, 0) : '—'}</td>
+            <td>${migIv(p.journey_point, p.journey_low, p.journey_high)}</td>
+            <td>${migIv(p.mig_point, p.mig_low, p.mig_high)}</td>
+            <td>${migBar(p.mig_point, maxHigh, 'purple')}</td>
+            <td class="num">${p.mig_point > 0.05 ? migIv(p.loss_mean_sec, p.loss_low_sec, p.loss_high_sec, 0) : '—'}</td>
+            <td>${vm ? badge(vm[0], vm[1]) : '<span class="muted">无抽样</span>'}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div>
+      <div class="small muted" style="margin-top:8px">总额外换乘损失（概率，小时）：
+        <b>${fmt(rows.reduce((s, r) => s + ((r.probabilistic || {}).total_loss_hours || 0), 0), 2)}</b> 小时
+        · 区间 [${fmt(rows.reduce((s, r) => s + ((r.probabilistic || {}).total_loss_low || 0), 0), 2)},
+        ${fmt(rows.reduce((s, r) => s + ((r.probabilistic || {}).total_loss_high || 0), 0), 2)}] 小时（逐 OD 求和）。
+      </div>
+    </div>`;
+};
+window.migToggleOnlyMig = async function () { MIG.onlyMig = !MIG.onlyMig; await MIG_VIEW.matrix($('#mig-body')); };
+
+/* ---------- ① 上车观察账 ---------- */
+MIG_VIEW.boardings = async function (el) {
+  const q = MIG.align !== 'ALL' ? `&alignStatus=${MIG.align}` : '';
+  const o = MIG.outageOnly ? '&outage=true' : '';
+  const d = await api(`/migration/boardings?limit=400${q}${o}`);
+  const rows = d.rows || [];
+  el.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-top:0;flex-wrap:wrap">
+        <h3 style="margin:0">上车观察账（首乘刷卡 × AVL 班次对齐）</h3>
+        <span style="flex:1"></span>
+        <div class="pill-row">
+          ${['ALL', 'ALIGNED', 'NEAREST_FALLBACK', 'GPS_GAP_FUZZY', 'UNMATCHED'].map(a =>
+            `<button class="filter-chip ${MIG.align === a ? 'active' : ''}" onclick="migSetAlign('${a}')">${a === 'ALL' ? '全部' : (MIG_ALIGN_META[a] ? MIG_ALIGN_META[a][0] : a)}</button>`).join('')}
+        </div>
+        <button class="filter-chip ${MIG.outageOnly ? 'active' : ''}" onclick="migToggleOutage()">仅定位中断</button>
+        <input id="mig-q" placeholder="搜索卡号/站/班次" value="${MIG.bq || ''}"
+          style="padding:7px 10px;border:1px solid var(--line);border-radius:8px"
+          onkeydown="if(event.key==='Enter')migBoardSearch()"/>
+        <button class="btn sm" onclick="migBoardSearch()">搜索</button>
+      </div>
+      <div class="table-wrap" style="max-height:62vh"><table class="data">
+        <thead><tr><th>账/卡号</th><th>时间</th><th>上车站</th><th>线路/车</th><th>对齐班次</th><th>对齐状态</th><th>标记</th><th class="num">概率迁移</th><th>确定终点</th></tr></thead>
+        <tbody>${rows.map(b => {
+          const am = MIG_ALIGN_META[b.align_status] || [b.align_status, 'gray'];
+          return `<tr class="clickable" onclick="migBoarding('${b.boarding_code}')">
+            <td class="mono small">${b.card_code}</td>
+            <td class="mono">${migHM(b.board_minute)}</td>
+            <td>${b.board_station}</td>
+            <td>${b.route_code}<span class="muted small"> / ${b.vehicle_code || '—'}</span></td>
+            <td class="mono small">${b.matched_trip || '—'}</td>
+            <td>${badge(am[0], am[1])}</td>
+            <td class="small">${b.location_outage ? badge('定位中断', 'purple') : ''} ${b.short_turn ? badge('短线折返', 'amber') : ''} ${b.has_tap_out ? badge('有下车', 'green') : ''} ${b.observed_transfer ? badge('有换乘', 'blue') : ''}</td>
+            <td class="num mono">${b.mig_prob !== null && b.mig_prob !== undefined ? fmt(b.mig_prob, 2) : '—'}</td>
+            <td class="small">${b.det_dest || '—'}</td>
+          </tr>`;
+        }).join('')}</tbody></table></div>
+      <div class="small muted" style="margin-top:6px">共 ${rows.length} 条（上限 400）。点击行查看候选下车站与双引擎路径后验。</div>
+    </div>`;
+};
+window.migSetAlign = async function (a) { MIG.align = a; await MIG_VIEW.boardings($('#mig-body')); };
+window.migToggleOutage = async function () { MIG.outageOnly = !MIG.outageOnly; await MIG_VIEW.boardings($('#mig-body')); };
+window.migBoardSearch = function () { MIG.bq = $('#mig-q').value.trim(); migRenderSub(); };
+
+window.migBoarding = async function (code) {
+  try {
+    const d = await api('/migration/boardings/' + encodeURIComponent(code));
+    const b = d.boarding, j = d.journey;
+    const opts = (j && asObj(j.prob_option_map)) || [];
+    migModal(`
+      <h2>上车账 ${b.boarding_code}</h2>
+      <p class="muted small">卡 ${b.card_code} · ${migHM(b.board_minute)} · ${b.board_station} · ${b.route_code}/${b.vehicle_code} · 对齐 ${b.matched_trip || '—'}（${b.align_status}，偏差 ${b.time_offset_sec}s）</p>
+      <div class="grid cards-2">
+        <div><h3>候选下车站集合（保留多候选）</h3>
+          ${(d.candidates || []).map(c => `
+            <div style="margin:8px 0">
+              <div class="small"><b>${c.station_code}</b> ${c.det_selected ? badge('确定性选定', 'gray') : ''} <span class="muted">${c.retain_reason || ''}</span> <span class="mono" style="float:right">${fmt(c.posterior_prob, 3)}</span></div>
+              ${migBar(c.posterior_prob, 1, 'purple')}
+            </div>`).join('')}
+        </div>
+        <div><h3>双引擎结论</h3>
+          <dl class="kv">
+            <dt>确定性</dt><dd>${j ? j.det_dest + ' · ' + j.det_path + ' · 换乘 ' + j.det_transfers + ' · 损失 ' + j.det_loss_sec + 's' : '—'} ${j && j.det_mismatch_risk ? badge('可能错配', 'amber') : ''}</dd>
+            <dt>概率迁移概率</dt><dd class="mono">${j ? fmt(j.mig_prob, 3) : '—'}</dd>
+            <dt>期望损失/方差</dt><dd class="mono">${j ? fmt(j.prob_loss_mean, 0) + 's / ' + fmt(j.prob_loss_var, 0) : '—'}</dd>
+            <dt>多候选/中断</dt><dd>${j && j.multi_candidate ? badge('多候选', 'purple') : badge('单一', 'gray')} ${j && j.location_outage ? badge('定位中断', 'purple') : ''}</dd>
+          </dl>
+        </div>
+      </div>
+      <h3>候选完整路径后验</h3>
+      <div class="table-wrap"><table class="data"><thead><tr><th>终点</th><th>方案</th><th>路径</th><th class="num">换乘</th><th class="num">等待(s)</th><th class="num">后验</th><th>额外折返换乘</th></tr></thead>
+        <tbody>${opts.map(o => `<tr>
+          <td><b>${o.dest}</b></td><td class="small mono">${o.plan}</td><td class="small">${(o.routes || []).join(' → ')}</td>
+          <td class="num">${o.transfers}</td><td class="num">${o.waitSec ?? o.wait_sec ?? ''}</td>
+          <td class="num mono">${fmt(o.probability, 3)}</td>
+          <td>${o.extraTransfer ? badge('是', 'red') : '—'}</td></tr>`).join('')}</tbody></table></div>`);
+  } catch (e) { toast('加载详情失败：' + e.message, true); }
+};
+
+/* ---------- ② 轨迹对齐 ---------- */
+MIG_VIEW.trajectories = async function (el) {
+  const rows = await api('/migration/trajectories');
+  el.innerHTML = `
+    <div class="card">
+      <h3 style="margin-top:0">车辆轨迹对齐（AVL/GPS 班次轨迹）</h3>
+      <p class="section-desc">上车刷卡按 线路+车辆+站点时刻 对齐到具体班次；定位中断区间缺测站不强行吸附，改为插值模糊对齐并在下车推断中保留多候选。点击行查看逐站轨迹点。</p>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>班次</th><th>线路</th><th>车</th><th>形态</th><th>折返站</th><th>定位中断</th><th class="num">拥堵延误(s)</th><th class="num">缺测 fix 点</th><th class="num">对齐上客</th></tr></thead>
+        <tbody>${rows.map(t => `<tr class="clickable" onclick="migTrip('${t.trip_code}')">
+          <td class="mono"><b>${t.trip_code}</b></td><td>${t.route_code}</td><td class="small">${t.vehicle_code}</td>
+          <td>${t.short_turn ? badge('短线折返', 'amber') : badge('全程', 'green')}</td>
+          <td>${t.turn_stop || '—'}</td>
+          <td>${t.outage ? badge(`${t.outage_from_stop}→${t.outage_to_stop}`, 'purple') : '—'}</td>
+          <td class="num">${t.congestion_sec || 0}</td>
+          <td class="num">${t.missing_fix_points}</td>
+          <td class="num">${t.aligned_boardings}</td>
+        </tr>`).join('')}</tbody></table></div>
+    </div>`;
+};
+window.migTrip = async function (code) {
+  try {
+    const d = await api('/migration/trajectories/' + encodeURIComponent(code));
+    const t = d.trace;
+    migModal(`<h2>轨迹 ${t.trip_code}</h2>
+      <p class="muted small">${t.route_code} / ${t.vehicle_code} · ${t.short_turn ? '短线折返于 ' + t.turn_stop : '全程至 ' + t.last_actual_stop}${t.outage ? ' · 定位中断 ' + t.outage_from_stop + '→' + t.outage_to_stop : ''}</p>
+      <div class="table-wrap"><table class="data"><thead><tr><th>seq</th><th>站</th><th>时刻</th><th class="num">km</th><th>fix</th></tr></thead>
+        <tbody>${(d.points || []).map(p => `<tr style="${p.fix_ok ? '' : 'background:#f3efff'}">
+          <td class="num">${p.seq_index}</td><td>${p.station_code || '（区间点）'}</td><td class="mono">${migHM(p.minute_of_day)}</td>
+          <td class="num">${fmt(p.progress_km, 1)}</td><td>${p.fix_ok ? badge('OK', 'green') : badge('中断/缺测', 'purple')}</td></tr>`).join('')}</tbody></table></div>
+      <h3>对齐到该班次的上车账</h3>
+      <div class="small">${(d.boardings || []).map(b => `<span class="badge gray" style="margin:3px;cursor:pointer" onclick="closeModal();migBoarding('${b.boarding_code}')">${b.card_code} · ${b.board_station} · ${b.align_status}</span>`).join('') || '<span class="muted">无</span>'}</div>`);
+  } catch (e) { toast('加载轨迹失败：' + e.message, true); }
+};
+
+/* ---------- ③ 重建旅程列表 ---------- */
+MIG_VIEW.journeys = async function (el) {
+  const qs = MIG.jMulti ? '&multiCandidate=true' : '';
+  const d = await api(`/migration/journeys?limit=400${qs}`);
+  const rows = d.rows || [];
+  el.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-top:0">
+        <h3 style="margin:0">重建旅程与候选下车站</h3><span style="flex:1"></span>
+        <button class="filter-chip ${MIG.jMulti ? 'active' : ''}" onclick="migToggleJMulti()">仅看多候选/中断</button>
+      </div>
+      <div class="table-wrap" style="max-height:62vh"><table class="data">
+        <thead><tr><th>旅程/卡</th><th>起点</th><th>确定终点</th><th class="num">换乘</th><th>错配风险</th><th class="num">概率迁移</th><th class="num">期望损失(s)</th><th>标志</th></tr></thead>
+        <tbody>${rows.map(j => `<tr class="clickable" onclick="migJourney('${j.card_code}')">
+          <td class="mono small">${j.card_code}</td><td>${j.origin_stop}</td><td><b>${j.det_dest || '—'}</b></td>
+          <td class="num">${j.det_transfers}</td>
+          <td>${j.det_mismatch_risk ? badge('风险', 'amber') : badge('低', 'green')}</td>
+          <td class="num mono">${fmt(j.mig_prob, 2)}</td>
+          <td class="num">${fmt(j.prob_loss_mean, 0)}</td>
+          <td class="small">${j.multi_candidate ? badge('多候选', 'purple') : ''} ${j.location_outage ? badge('中断', 'purple') : ''} ${j.short_turn ? badge('折返', 'amber') : ''}</td>
+        </tr>`).join('')}</tbody></table></div>
+      <div class="small muted" style="margin-top:6px">${rows.length} 条。点击查看候选集合与路径后验。</div>
+    </div>`;
+};
+window.migToggleJMulti = async function () { MIG.jMulti = !MIG.jMulti; await MIG_VIEW.journeys($('#mig-body')); };
+window.migJourney = async function (key) { return window.migBoarding(key); };
+
+/* ---------- ⑤ 抽样核验 ---------- */
+MIG_VIEW.verification = async function (el) {
+  const d = await api('/migration/surveys');
+  const vrows = d.verification || [];
+  el.innerHTML = `
+    <div class="card">
+      <h3 style="margin-top:0">抽样调查核验：调查区间 vs 推断区间</h3>
+      <p class="section-desc">抽样额外换乘比例用 Wilson 95% 区间并按 OD 代表总体换算为迁移量区间，再与概率推断区间比较。<b>区间不重叠即判 CONFLICT，该 OD 禁止发布单点迁移量。</b></p>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>OD</th><th class="num">样本 n</th><th class="num">报告额外换乘</th><th>抽样比例(95% Wilson)</th><th>抽样迁移量区间</th><th>推断迁移量区间</th><th>结论</th><th>说明</th></tr></thead>
+        <tbody>${vrows.map(v => {
+          const m = MIG_VERIFY_META[v.status] || [v.status, 'gray'];
+          return `<tr style="${v.status === 'CONFLICT' ? 'background:#fdeeec' : ''}">
+            <td><b>${v.origin_stop}</b>→<b>${v.dest_stop}</b></td>
+            <td class="num">${v.sample_n}</td><td class="num">${v.extra_yes}</td>
+            <td>${fmt(v.survey_share, 3)} <span class="muted small">[${fmt(v.survey_low, 3)},${fmt(v.survey_high, 3)}]</span></td>
+            <td class="mono small">[${fmt(v.survey_vol_low)}, ${fmt(v.survey_vol_high)}]</td>
+            <td class="mono small">[${fmt(v.infer_low)}, ${fmt(v.infer_high)}]</td>
+            <td>${badge(m[0], m[1])}</td>
+            <td class="small muted">${v.note || ''}</td>
+          </tr>`;
+        }).join('')}</tbody></table></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>原始抽样记录</h3>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>样本号</th><th>OD</th><th class="num">n</th><th class="num">yes</th><th class="num">代表总体</th><th>来源</th><th>备注</th></tr></thead>
+        <tbody>${(d.samples || []).map(s => `<tr>
+          <td class="mono small">${s.sample_code}</td><td>${s.origin_stop}→${s.dest_stop}</td>
+          <td class="num">${s.sample_n}</td><td class="num">${s.extra_yes}</td><td class="num">${s.od_population}</td>
+          <td>${s.source}</td><td class="small muted">${s.note || ''}</td></tr>`).join('')}</tbody></table></div>
+    </div>`;
+};
+
+/* ---------- 📣 发布门控 ---------- */
+MIG_VIEW.publication = async function (el) {
+  const [p, sv] = await Promise.all([api('/migration/publication'), api('/migration/verification')]);
+  const g = p.gate || {}, hist = p.history || [], vrows = sv.rows || [];
+  const conflicts = g.conflictOds || [];
+  el.innerHTML = `
+    <div class="${conflicts.length ? 'banner red' : 'banner green'}">
+      <span class="big">${conflicts.length ? '⛔' : '✅'}</span>
+      <div><b>门控：${g.status}</b><div>${g.reason || ''}</div></div>
+    </div>
+    <div class="grid cards-2" style="margin-top:14px">
+      <div class="card">
+        <h3>报告级发布</h3>
+        <p class="section-desc">冲突存在时，“发布单点总量”会被服务端 409 拒绝；“发布包络区间”始终允许，状态为 INTERVAL_ONLY。</p>
+        <div class="pill-row">
+          <button class="btn primary" onclick="migPublish({scope:'REPORT',mode:'INTERVAL'})">发布报告级包络区间</button>
+          <button class="btn danger" onclick="migPublish({scope:'REPORT',mode:'POINT'})">尝试发布报告级单点（应 409）</button>
+        </div>
+        <div id="pub-msg" class="small" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <h3>分 OD 发布</h3>
+        <div class="table-wrap" style="max-height:240px"><table class="data">
+          <thead><tr><th>OD</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>${vrows.map(v => `<tr>
+            <td class="small"><b>${v.origin_stop}</b>→<b>${v.dest_stop}</b></td>
+            <td>${badge((MIG_VERIFY_META[v.status] || [v.status])[0], (MIG_VERIFY_META[v.status] || [,'gray'])[1])}</td>
+            <td class="pill-row">
+              <button class="btn sm" onclick="migPublishOd('${v.origin_stop}','${v.dest_stop}','INTERVAL')">区间</button>
+              <button class="btn sm ${v.status === 'CONFLICT' ? 'danger' : 'primary'}" onclick="migPublishOd('${v.origin_stop}','${v.dest_stop}','POINT')">单点</button>
+            </td></tr>`).join('')}</tbody></table></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>发布历史（留痕）</h3>
+      <div class="table-wrap" style="max-height:280px"><table class="data">
+        <thead><tr><th>时间</th><th>范围</th><th>模式</th><th>状态</th><th class="num">单点</th><th class="num">区间</th><th>理由</th><th>发布人</th></tr></thead>
+        <tbody>${hist.map(h => `<tr>
+          <td class="small">${dt(h.created_at)}</td><td class="mono small">${h.scope}</td><td>${h.publish_mode}</td>
+          <td>${badge(h.status, h.status === 'PUBLISHED' ? 'green' : 'amber')}</td>
+          <td class="num">${h.point_value != null ? fmt(h.point_value) : '—'}</td>
+          <td class="num mono small">${h.interval_low != null ? '[' + fmt(h.interval_low) + ',' + fmt(h.interval_high) + ']' : '—'}</td>
+          <td class="small muted">${h.reason || ''}</td><td class="small">${h.published_by || ''}</td>
+        </tr>`).join('')}</tbody></table></div>
+    </div>`;
+};
+window.migPublishOd = function (o, d, mode) {
+  return migPublish({ scope: 'OD', origin: o, dest: d, mode });
+};
+window.migPublish = async function (payload) {
+  const msg = $('#pub-msg');
+  try {
+    const r = await api('/migration/publish', { method: 'POST', body: JSON.stringify(payload) });
+    if (msg) msg.innerHTML = `<span class="expected-ok">已${r.status === 'PUBLISHED' ? '发布' : '仅发布区间'}：${r.scope} ${r.mode} ${r.intervalLow != null ? '[' + r.intervalLow + ',' + r.intervalHigh + ']' : '点=' + r.pointValue}</span>`;
+    toast('发布成功：' + r.status);
+    if (MIG.sub === 'publication') { const el = $('#mig-body'); await MIG_VIEW.publication(el); }
+  } catch (e) {
+    if (msg) msg.innerHTML = `<span class="expected-bad">服务端拒绝（${e.status}）：${e.message}</span>`;
+    if (e.status === 403) toast('403：当前账号无权发布', true);
+    else toast('已被门控拒绝：' + e.message, true);
+  }
 };
 
 init().catch(e => {
